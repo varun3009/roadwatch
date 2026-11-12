@@ -26,7 +26,7 @@ from .config import effective_calibration, number
 from .datasets import normalize_hazard
 from .engine import HazardAccumulator
 from .geometry import calibration_from_dict, locate_hazard, project_pixel
-from .submissions import _boxes, position_at
+from .submissions import _boxes, upload_ground_range, upload_location_at
 
 
 LEASE_SECONDS = 60
@@ -173,6 +173,9 @@ class ReplayDetectionService:
         origin = metadata.get("origin_source_type") or metadata.get("source_type")
         upload = record.get("kind") == "upload" or origin == "upload"
         location = {key: metadata.get(key) for key in ("location_reference", "gps_track", "supplied_latitude", "supplied_longitude", "gps_accuracy_m")}
+        if upload and metadata.get("use_calibration"):
+            config["calibration"] = session["config"]["calibration"]
+            location["use_calibration"] = True
         if upload and not location.get("gps_track") and location["gps_accuracy_m"] is None and session:
             existing = self.store.hazards(session["id"])
             location["gps_accuracy_m"] = next((item.get("gps_accuracy_m") for item in existing if item.get("gps_accuracy_m") is not None), None)
@@ -247,19 +250,13 @@ class ReplayDetectionService:
         record_id = context.get("recording_id")
         if context["upload"]:
             data = context["location"]
-            values = {"latitude": data.get("supplied_latitude"), "longitude": data.get("supplied_longitude"),
-                      "gps_accuracy_m": data.get("gps_accuracy_m"), "gps_track": data.get("gps_track")}
-            location = position_at(values, time_s)
-            reference = data.get("location_reference") or "capture"
-            method = "user_supplied_hazard_location" if reference == "hazard" else "interpolated_capture_location_proxy" if values["gps_track"] else "fixed_capture_location_proxy"
-            note = ("Reporter-supplied hazard coordinates; independently unverified." if reference == "hazard" else
-                    "Camera/capture location used as an approximate hazard-location proxy, not a surveyed hazard center. No road-distance projection was applied.")
-            if location is None:
-                note = "GPS track has no synchronized fix here (outside coverage or gap over 3 seconds); coordinates are unavailable."
-            return {"latitude": location.get("latitude") if location else None, "longitude": location.get("longitude") if location else None,
-                    "gps_accuracy_m": location.get("gps_accuracy_m") if location else None, "distance_m": None,
-                    "provisional": True, "location_reference": reference, "location_method": method, "location_note": note,
-                    "accuracy_note": note, "method": method, "distance_kind": None}
+            location = upload_location_at({**data, "latitude": data.get("supplied_latitude"),
+                                           "longitude": data.get("supplied_longitude")}, time_s)
+            if data.get("use_calibration"):
+                calibration = calibration_from_dict(config["calibration"])
+                return {**location, **upload_ground_range(box["bbox"], width, height, calibration)}
+            return {**location, "distance_m": None, "provisional": True,
+                    "method": location["location_method"], "distance_kind": None}
         calibration = calibration_from_dict(config["calibration"])
         sensor_time = time_s + config["sync_offset_s"]
         mode = "dataset" if record_id else "manual" if config["pose"]["mode"] == "manual" else None
@@ -388,7 +385,7 @@ class ReplayDetectionService:
                         if context["upload"]:
                             for field in ("location_reference", "location_method", "location_note", "accuracy_note"):
                                 item[field] = detection.get(field)
-                            item["ground_model"] = None
+                            item["ground_model"] = detection.get("ground_model")
                             if previous and previous.get("latitude") is not None:
                                 for field in ("latitude", "longitude", "gps_accuracy_m", "location_note", "accuracy_note"):
                                     item[field] = previous.get(field)

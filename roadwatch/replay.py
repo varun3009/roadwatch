@@ -55,7 +55,7 @@ class ReplayService:
             metadata = session.get("metadata") or {}
             original = session.get("source") or ""
             if metadata.get("media_kind") == "photo":
-                raise ValueError("Photos can be viewed in the hazard evidence gallery")
+                raise ValueError("Choose a video for detection replay")
             if metadata.get("recording_id") or original.startswith("dataset:"):
                 record = self._record(metadata.get("recording_id") or original.split(":", 1)[1])
             else:
@@ -116,7 +116,7 @@ class ReplayService:
                 value = {"duration_s": duration, "fps": fps, "frame_count": count,
                          "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
                          "kind": record["kind"], "preview_fps": 5, "audio": False,
-                         "note": "Original video preview. Detection evidence and annotations are available in the hazard library.",
+                         "note": "Original video preview. Open Detection replay to see YOLO annotations.",
                          "_times": times}
                 # Bounded metadata cache. It contains no decoded video frames.
                 if len(self.info_cache) >= 64:

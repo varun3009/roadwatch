@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import ConfigStore, number, effective_calibration
@@ -26,11 +26,10 @@ from .engine import Engine
 from .geometry import calibration_from_dict, project_pixel, locate_hazard, calibrate_checkerboard
 from .comma_geometry import project_comma_pixel
 from .storage import Store
-from .library_api import make_library_router
 from .replay import ReplayService, make_replay_router
 from .submissions import SubmissionService, make_submission_router
 from .replay_detection import ReplayDetectionService, make_replay_detection_router
-from .evidence_recovery import EvidenceRecoveryService, make_evidence_recovery_router
+from .reports import HazardReport, incident_report_html
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "roadwatch_data"
@@ -41,7 +40,6 @@ engine = Engine(ROOT, config_store, catalog, store)
 replay_service = ReplayService(ROOT, catalog, store)
 submission_service = SubmissionService(ROOT, store, config_store, engine)
 replay_detection_service = ReplayDetectionService(ROOT, catalog, store, config_store, engine, submission_service, replay_service)
-evidence_recovery_service = EvidenceRecoveryService(ROOT, store, catalog, replay_service, config_store, engine, submission_service, replay_detection_service)
 
 
 @asynccontextmanager
@@ -49,15 +47,12 @@ async def lifespan(app):
     yield
     engine.stop()
     replay_detection_service.stop()
-    evidence_recovery_service.stop()
     submission_service.stop()
     replay_service.close()
 
 
 app = FastAPI(title="RoadWatch", version="1.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
-app.include_router(make_evidence_recovery_router(evidence_recovery_service))
-app.include_router(make_library_router(store, ROOT))
 app.include_router(make_replay_router(replay_service))
 app.include_router(make_replay_detection_router(replay_detection_service))
 app.include_router(make_submission_router(submission_service))
@@ -137,7 +132,7 @@ def state():
 def save_config(value: dict):
     with engine.lock:
         if engine.active() or submission_service.active():
-            raise HTTPException(409, "Stop detection and close replay or wait for evidence recovery or uploads before changing settings")
+            raise HTTPException(409, "Stop detection, close replay, or wait for the current upload before changing settings")
         try:
             saved = config_store.save(value)
             engine.model_info = {"path": saved["detection"]["model_path"], "classes": [], "status": "Load on start"}
@@ -151,7 +146,7 @@ def start_session(value: dict):
     try:
         with engine.lock:
             if submission_service.active():
-                raise RuntimeError("Close detection replay or wait for the current upload or evidence recovery to finish")
+                raise RuntimeError("Close detection replay or wait for the current upload to finish")
             return engine.start(value)
     except (ValueError, TypeError, RuntimeError) as exc:
         raise bad_request(exc) from exc
@@ -277,6 +272,41 @@ async def checkerboard(images: list[UploadFile] = File(...), columns: int = Form
 @app.get("/api/hazards")
 def saved_hazards(session_id: str | None = None):
     return {"hazards": store.hazards(session_id)}
+
+
+@app.get("/api/hazard-report")
+def hazard_report(hazard_id: str):
+    hazard = store.hazard(hazard_id)
+    if hazard is None:
+        raise HTTPException(404, "Hazard not found")
+    return hazard
+
+
+@app.put("/api/hazard-report")
+def save_hazard_report(hazard_id: str, report: HazardReport):
+    hazard = store.save_hazard_report(hazard_id, report.model_dump())
+    if hazard is None:
+        raise HTTPException(404, "Hazard not found")
+    return hazard
+
+
+@app.get("/api/incident-report", response_class=HTMLResponse)
+def incident_report(hazard_id: str):
+    hazard = hazard_report(hazard_id)
+    return HTMLResponse(incident_report_html(hazard, store.evidence(hazard_id)), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/evidence/{evidence_id}.jpg")
+def evidence_image(evidence_id: int):
+    image = store.evidence_image(evidence_id)
+    if image is None:
+        raise HTTPException(404, "Evidence image not found")
+    jpeg, metadata = image
+    return Response(jpeg, media_type="image/jpeg", headers={
+        "Cache-Control": "private, max-age=31536000, immutable",
+        "X-Content-Type-Options": "nosniff",
+        "ETag": f'"{metadata["sha256"]}"',
+    })
 
 
 @app.get("/api/export.csv")

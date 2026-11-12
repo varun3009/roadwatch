@@ -6,11 +6,13 @@ import hashlib
 import sqlite3
 import math
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 
 MAX_EVIDENCE_FRAMES = 10
-REVIEW_FIELDS = {"status", "notes", "address", "title", "municipal_authority", "reporter_name", "reporter_contact", "severity"}
+REVIEW_FIELDS = {"status", "notes", "address", "title", "municipal_authority", "reporter_name", "reporter_contact",
+                 "severity", "reported_at"}
 
 
 class Store:
@@ -90,6 +92,7 @@ class Store:
     @staticmethod
     def _hazard_value(row):
         value = json.loads(row[0])
+        # Keep user-entered details separate from updates by the detector.
         review = json.loads(row[3]) if row[3] else {}
         value.update({key: item for key, item in review.items() if key in REVIEW_FIELDS})
         value.setdefault("status", "open")
@@ -105,33 +108,20 @@ class Store:
             row = db.execute(self._hazard_query() + " WHERE h.id=?", (hazard_id,)).fetchone()
         return self._hazard_value(row) if row else None
 
-    def update_hazard_review(self, hazard_id, changes):
-        if not isinstance(changes, dict) or set(changes) - REVIEW_FIELDS:
-            raise ValueError("Only complaint details, severity and review status can be edited")
-        normalized = {}
-        for field, value in changes.items():
-            if not isinstance(value, str):
-                raise ValueError(f"{field} must be text")
-            value = value.strip()
-            maximum = 5000 if field == "notes" else 500 if field in {"address", "reporter_contact"} else 300
-            if len(value) > maximum:
-                raise ValueError(f"{field} must be at most {maximum} characters")
-            if field == "status" and value not in {"open", "reported", "resolved"}:
-                raise ValueError("Choose open, reported or resolved status")
-            if field == "severity" and value not in {"low", "medium", "high"}:
-                raise ValueError("Choose low, medium or high severity")
-            normalized[field] = value
+    def save_hazard_report(self, hazard_id, details):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not db.execute("SELECT 1 FROM hazards WHERE id=?", (hazard_id,)).fetchone():
+            row = db.execute(self._hazard_query() + " WHERE h.id=?", (hazard_id,)).fetchone()
+            if row is None:
                 return None
-            row = db.execute("SELECT payload FROM hazard_review WHERE hazard_id=?", (hazard_id,)).fetchone()
-            value = json.loads(row[0]) if row else {}
-            value.update(normalized)
-            db.execute("INSERT INTO hazard_review(hazard_id,payload) VALUES(?,?) ON CONFLICT(hazard_id) DO UPDATE SET payload=excluded.payload",
-                       (hazard_id, json.dumps(value, allow_nan=False)))
-            db.execute("UPDATE hazards SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (hazard_id,))
-        return self.hazard(hazard_id)
+            review = json.loads(row[3]) if row[3] else {}
+            review.update(details)
+            review.setdefault("reported_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+            db.execute("INSERT INTO hazard_review(hazard_id,payload) VALUES(?,?) "
+                       "ON CONFLICT(hazard_id) DO UPDATE SET payload=excluded.payload",
+                       (hazard_id, json.dumps(review, allow_nan=False)))
+            updated = db.execute(self._hazard_query() + " WHERE h.id=?", (hazard_id,)).fetchone()
+        return self._hazard_value(updated)
 
     def save_evidence(self, hazard_id, jpeg, metadata, max_frames=MAX_EVIDENCE_FRAMES):
         """Persist at most ten JPEG frames per hazard, including concurrent writers."""

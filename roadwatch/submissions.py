@@ -1,7 +1,7 @@
 """Local citizen submissions with bounded media, explicit GPS provenance and jobs.
 
-Uploaded GPS is deliberately never treated as a calibrated road projection.
-It is either a user-selected hazard position or the camera location at capture.
+Calibration estimates ground range in video. Uploaded GPS retains its own
+provenance as either a user-selected hazard position or a capture location.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from PIL import Image
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from .config import number
+from .geometry import calibration_from_dict, project_pixel
 
 
 MAX_UPLOAD_BYTES = 250 * 1024 * 1024
@@ -40,8 +41,8 @@ def _text(value, label, maximum=4000):
     return value
 
 
-def validate_submission(values):
-    """Validate human-entered coordinates before any job or upload is committed."""
+def validate_submission(values, *, media_kind=None):
+    """Validate form values before any job or upload is committed."""
     result = dict(values)
     if result.get("mode") not in {"detect", "manual"}:
         raise ValueError("Choose detect or manual submission")
@@ -55,6 +56,9 @@ def validate_submission(values):
         result[key] = _text(result.get(key), key.replace("_", " ").title(), maximum)
     if result["mode"] == "manual" and not result["hazard_type"]:
         raise ValueError("Enter a hazard type for a manual report")
+    detect_video = result["mode"] == "detect" and media_kind == "video"
+    if result.get("use_calibration") and not detect_video:
+        raise ValueError("Camera calibration applies to automatic video detection")
     track = result.get("gps_track")
     if isinstance(track, str):
         try:
@@ -82,7 +86,7 @@ def validate_submission(values):
     else:
         result["gps_track"] = None
     lat, lon = result.get("latitude"), result.get("longitude")
-    if lat not in (None, "") or lon not in (None, "") or track is None:
+    if lat not in (None, "") or lon not in (None, "") or (track is None and not detect_video):
         result["latitude"] = number(lat, "Latitude", -90, 90)
         result["longitude"] = number(lon, "Longitude", -180, 180)
     else:
@@ -96,8 +100,10 @@ def position_at(values, time_s):
     """Interpolate capture GPS only, rejecting missing coverage and long gaps."""
     track = values.get("gps_track")
     if not track:
-        return {"latitude": values.get("latitude"), "longitude": values.get("longitude"),
-                "gps_accuracy_m": values.get("gps_accuracy_m")}
+        latitude, longitude = values.get("latitude"), values.get("longitude")
+        if latitude is None or longitude is None:
+            return None
+        return {"latitude": latitude, "longitude": longitude, "gps_accuracy_m": values.get("gps_accuracy_m")}
     times = [point["time_s"] for point in track]
     at = bisect.bisect_left(times, time_s)
     if at < len(track) and abs(times[at] - time_s) < 1e-7:
@@ -115,6 +121,40 @@ def position_at(values, time_s):
     return {"latitude": left["latitude"] + amount * (right["latitude"] - left["latitude"]),
             "longitude": (left["longitude"] + amount * longitude_delta + 180) % 360 - 180,
             "gps_accuracy_m": accuracy}
+
+
+def upload_location_at(values, time_s):
+    """Describe uploaded GPS independently of the video ground range."""
+    position = position_at(values, time_s)
+    reference = values.get("location_reference") or "capture"
+    if values.get("gps_track"):
+        method = "interpolated_capture_location_proxy"
+        note = ("Interpolated camera position at this video timestamp. "
+                "The point is an approximate hazard location." if position else
+                "No synchronized GPS fix at this timestamp. The frame is outside track coverage or in a gap over 3 seconds.")
+    elif position is None:
+        method = None
+        note = "No GPS coordinates were supplied for this video."
+    elif reference == "hazard":
+        method = "user_supplied_hazard_location"
+        note = "The reporter supplied these hazard coordinates."
+    else:
+        method = "fixed_capture_location_proxy"
+        note = "Reporter-supplied capture location. A fixed coordinate applies to the whole upload and may differ from the hazard position."
+    return {"latitude": position["latitude"] if position else None,
+            "longitude": position["longitude"] if position else None,
+            "gps_accuracy_m": position.get("gps_accuracy_m") if position else None,
+            "location_reference": reference, "location_method": method, "location_note": note, "accuracy_note": note}
+
+
+def upload_ground_range(bbox, width, height, calibration):
+    x1, y1, x2, y2 = bbox
+    u = min(width - 1, max(0, (x1 + x2) / 2))
+    v = min(height - 1, max(0, y2 if calibration.point_mode == "bottom_center" else (y1 + y2) / 2))
+    projection = project_pixel(u, v, width, height, calibration)
+    return {"distance_m": projection["distance_m"], "projection_reason": projection["reason"],
+            "provisional": projection["provisional"], "ground_model": projection["ground_model"],
+            "method": projection["method"], "distance_kind": "horizontal_from_gps_antenna"}
 
 
 def _resize(frame):
@@ -237,33 +277,19 @@ class SubmissionService:
                                   original_filename=original_filename, media_kind=kind, submission_id=job_id,
                                   submission=job, location_reference=values["location_reference"],
                                   gps_track=values.get("gps_track"), supplied_latitude=values.get("latitude"),
-                                  supplied_longitude=values.get("longitude"))
+                                  supplied_longitude=values.get("longitude"), gps_accuracy_m=values.get("gps_accuracy_m"),
+                                  use_calibration=bool(values.get("use_calibration")))
         self.worker = threading.Thread(target=self._run, args=(job_id, values, path, kind, config), daemon=True)
         self.worker.start()
         return copy.deepcopy(job)
 
     def _hazard(self, job_id, key, box, values, time_s, kind):
-        position = position_at(values, time_s)
-        reference = values["location_reference"]
-        if reference == "hazard":
-            location_method = "user_supplied_hazard_location"
-            location_note = "Hazard coordinates entered by the reporter; independently unverified."
-        elif values.get("gps_track"):
-            location_method = "interpolated_capture_location_proxy"
-            location_note = "Interpolated camera position at this video timestamp, not a surveyed hazard center. No road-distance projection was applied."
-        else:
-            location_method = "fixed_capture_location_proxy"
-            location_note = "Reporter-supplied capture location. A fixed coordinate applies to the whole upload and may differ from the hazard position; no road-distance projection was applied."
-        if position is None:
-            location_note = "No synchronized GPS track fix at this timestamp (outside coverage or gap over 3 seconds); hazard coordinates are unavailable."
         manual = values["mode"] == "manual"
         hazard = {"id": f"{job_id}:{key}", "session_id": job_id, "track_id": key,
                   "recording_id": None, "dataset_id": None, "source_type": "manual" if manual else "upload_" + str(kind),
                   "class_name": box["class_name"], "hazard_type": box["class_name"], "confidence": box.get("confidence"),
                   "bbox": box.get("bbox"), "observations": 1, "first_seen_s": time_s, "last_seen_s": time_s,
-                  "latitude": position["latitude"] if position else None, "longitude": position["longitude"] if position else None,
-                  "gps_accuracy_m": position.get("gps_accuracy_m") if position else None, "location_reference": reference,
-                  "location_method": location_method, "location_note": location_note, "accuracy_note": location_note,
+                  **upload_location_at(values, time_s),
                   "distance_m": None, "provisional": True, "has_reference_labels": False, "match": None,
                   "status": "open", "severity": values["severity"], "title": values["title"] or box["class_name"],
                   "notes": values["notes"], "address": values["address"], "municipal_authority": values["municipal_authority"],
@@ -272,10 +298,12 @@ class SubmissionService:
                   "submission_id": job_id}
         return hazard
 
-    def _save_observation(self, job_id, key, box, values, frame, index, time_s, kind, annotations):
+    def _save_observation(self, job_id, key, box, values, frame, index, time_s, kind, annotations, calibration=None):
         identity = f"{job_id}:{key}"
         previous = self.store.hazard(identity)
         item = self._hazard(job_id, key, box, values, time_s, kind)
+        if calibration is not None:
+            item.update(upload_ground_range(box["bbox"], frame.shape[1], frame.shape[0], calibration))
         if previous:
             # Keep one record per tracker and the strongest class observation.
             item.update(first_seen_s=previous["first_seen_s"], observations=previous["observations"] + 1)
@@ -339,6 +367,7 @@ class SubmissionService:
                     self._save_observation(job_id, str(index + 1), box, values, frame, 0, 0, kind, [] if manual else boxes)
                 self.store.session_update(job_id, duration_s=0, frame_count=1, frame_width=frame.shape[1], frame_height=frame.shape[0])
             else:
+                calibration = calibration_from_dict(config["calibration"]) if values.get("use_calibration") else None
                 cap = cv2.VideoCapture(str(path))
                 if not cap.isOpened():
                     raise ValueError("Could not decode this video. Use an MP4, MOV, AVI, MKV or WebM clip.")
@@ -389,7 +418,7 @@ class SubmissionService:
                     boxes = _boxes(model.track(frame, **kwargs)[0], model.names)
                     for box in boxes:
                         if box["track_id"] is not None:
-                            self._save_observation(job_id, str(box["track_id"]), box, values, frame, index, time_s, kind, boxes)
+                            self._save_observation(job_id, str(box["track_id"]), box, values, frame, index, time_s, kind, boxes, calibration)
                     sampled += 1
                     self._job_update(job_id, progress=min(99, round(100 * (index + 1) / total)) if total else min(99, round(100 * time_s / MAX_VIDEO_SECONDS)),
                                      processed_frames=sampled, sample_stride=stride)
@@ -409,7 +438,7 @@ class SubmissionService:
                     self.jobs.pop(oldest)
                     self._persisted_at.pop(oldest, None)
         except Exception as exc:
-            terminal = {"status": "error", "error": str(exc), "message": "Submission processing failed; any saved evidence remains in the hazard library."}
+            terminal = {"status": "error", "error": str(exc), "message": "Submission processing failed. Any evidence already saved is still available."}
         finally:
             if cap:
                 cap.release()
@@ -432,17 +461,11 @@ def make_submission_router(service):
                      location_reference: str = Form("capture"), hazard_type: str = Form(""),
                      title: str = Form(""), notes: str = Form(""), address: str = Form(""),
                      severity: str = Form("medium"), municipal_authority: str = Form(""),
-                     gps_accuracy_m: str | None = Form(None), gps_track: str = Form("")):
+                     gps_accuracy_m: str | None = Form(None), gps_track: str = Form(""),
+                     use_calibration: bool = Form(False)):
         path = None
         reserved = False
         try:
-            values = validate_submission({"mode": mode, "latitude": latitude, "longitude": longitude,
-                                          "location_reference": location_reference, "hazard_type": hazard_type,
-                                          "title": title, "notes": notes, "address": address, "severity": severity,
-                                          "municipal_authority": municipal_authority, "gps_accuracy_m": gps_accuracy_m,
-                                          "gps_track": gps_track})
-            if mode == "detect" and file is None:
-                raise ValueError("Choose a photo or video for detection, or select manual report")
             kind, original = None, None
             if file is not None and file.filename:
                 original = Path(file.filename.replace("\\", "/")).name
@@ -454,12 +477,17 @@ def make_submission_router(service):
                     kind, limit = "video", MAX_UPLOAD_BYTES
                 else:
                     raise ValueError("Choose a JPG, PNG, WebP, BMP image or MP4, MOV, AVI, MKV, WebM video")
-                if kind == "photo" and values.get("gps_track"):
-                    raise ValueError("A GPS track is for video. Enter one coordinate for a photo.")
             elif file is not None:
                 file = None
             if mode == "detect" and file is None:
-                raise ValueError("Choose a nonempty photo or video file")
+                raise ValueError("Choose a photo or video for detection, or select manual report")
+            values = validate_submission({"mode": mode, "latitude": latitude, "longitude": longitude,
+                                          "location_reference": location_reference, "hazard_type": hazard_type,
+                                          "title": title, "notes": notes, "address": address, "severity": severity,
+                                          "municipal_authority": municipal_authority, "gps_accuracy_m": gps_accuracy_m,
+                                          "gps_track": gps_track, "use_calibration": use_calibration}, media_kind=kind)
+            if kind == "photo" and values.get("gps_track"):
+                raise ValueError("A GPS track is for video. Enter one coordinate for a photo.")
             service.reserve()
             reserved = True
             if file is not None:

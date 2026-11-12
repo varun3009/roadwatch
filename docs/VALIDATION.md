@@ -4,25 +4,21 @@ Verified locally against the supplied model and source data. RoadSens uses the d
 
 ## Automated checks
 
-- `python -m pytest -q`: **207 tests passed**, with 39 additional subtests. One upstream FastAPI/Starlette test-client deprecation warning remains; application checks pass.
-- JavaScript syntax checks passed for `roadwatch/static/app.js` and `roadwatch/static/library.js`.
+- Run `python -m pytest -q` to verify the current checkout.
+- The Vue dashboard is served directly from `roadwatch/static/`. Check module syntax with `node --check` and verify navigation, live detection, uploads, calibration and replay in a browser.
 - Tests cover known camera/road geometry, heading and mounting signs, checkerboard intrinsics recovery, invalid projections, sparse GPS gaps, workbook mappings, duplicate event windows, import provenance, timestamp freshness, tracking identity and classification changes, persistence and HTTP/WebSocket behavior.
 - comma2k19 checks also cover native frame clocks, ECEF/quaternion projection, unlabeled reference isolation, GNSS fallback, source-specific calibration, chunk discovery/deduplication, resumable HTTP transfers, publisher hashes, safe ZIP extraction, CRC failures, concurrent status writes, pause controls and worker error propagation.
 
-## Persistent library, uploads and complaint workflow
+## Uploads, replay and saved detections
 
 - Detection replay now runs YOLO as frames are played or sought, draws prominent bounding boxes, logs hazards and saves annotated evidence. A real uploaded sample frame produced a Longitudinal prediction and saved photo. Requesting the identical frame again returned the persisted analysis with unchanged observation count. Unit tests also verify atomic rollback, model/source/settings invalidation, source aliases, restart reuse, backward association, the evidence cap and shared inference ownership.
-- Recovered photographs for **all 61 historical records that had no images**, with zero failures. Every existing record then had at least one image. Recovery extracts real original source frames, identifies newly reconstructed model boxes, preserves historical hazard coordinates/classes, and carries that provenance into complaint HTML and ZIP metadata.
-- The library was redesigned around large photographs, photo-presence filters, source-recovery actions and a large evidence hero/thumbnail strip. Browser verification confirmed the recovered images load and the detection-replay frame displays its class/confidence box, frame number, cache state and evidence log.
-- An actual five-second uploaded clip was played through the new detection UI: 26 visited frames produced three associated hazard tracks and five saved photos. Seeking/restarting at a cached frame preserved the original eight total observations. Every one of the resulting 70 library thumbnails returned a valid decoded image; none of the records lacked photographs or exceeded the ten-frame cap.
+- An actual five-second uploaded clip was played through the new detection UI: 26 visited frames produced three associated hazard tracks and five saved photos. Seeking/restarting at a cached frame preserved the original eight total observations.
 
 - SQLite migration retains earlier sessions and records. JPEG evidence is stored as BLOBs with SHA-256 hashes and per-frame metadata. A database trigger and reserved writer transaction enforce the ten-frame limit; forty concurrent writers saved exactly ten frames. Live tracking captures frames at least 0.5 seconds apart, up to the cap. Observation counts remain independent of saved-frame counts.
 - The full native comma2k19 sample was replayed through the actual model after this change: eight detections yielded four tracked crack predictions, each with one spaced evidence frame. Persisted frame counts matched the live state.
-- An actual five-second sample video upload yielded one tracked crack prediction with three evidence images. A still photo from the same historical recording yielded one crack prediction with one image. Another image yielded zero predictions and correctly created no hazard. These example uploads are labeled as historical workflow demonstrations, not current municipal complaints.
-- Browser checks covered photo upload with GPS, progress/result display, nearby search using an explicitly entered dataset point, evidence viewing, complaint edit/save, uploaded video play/end/restart, and a printable complaint preview. The actual ZIP download included the report and evidence. Browser geolocation remains an optional user action; no live personal location was obtained during validation.
-- Restarting the server retained hazard images, uploaded media, completed job status and complaint details. Older records without images remain available and clearly show that no evidence frame was saved.
+- An actual five-second sample video upload yielded one tracked crack prediction with three evidence images. A still photo from the same historical recording yielded one crack prediction with one image. Another image yielded zero predictions and correctly created no hazard.
+- Restarting the server retained hazard images, uploaded media, and completed job status.
 - Replay decoder tests used actual generated video frames to verify forward/backward seeking, native comma frame timestamps, the final frame, repeated frame requests, original-file Range downloads, and rejection of missing/external sources. Uploaded GPS tests cover fixed capture proxies, user-selected hazard points, timestamp interpolation, dateline wrapping, missing coverage and gaps.
-- Complaint exports preserve coordinate provenance and escape user text. Reports are drafts: printing/downloading does not submit them to an authority or change the local status to reported. Reported/resolved states are set explicitly by the user.
 - Test discovery is restricted to `tests/`, avoiding recursive collection through the full dataset. The completed comma catalog contains 2,035 validated recordings; an isolated initial catalog scan took 12.57 seconds, with subsequent in-process access cached.
 
 ## Actual comma2k19 replay

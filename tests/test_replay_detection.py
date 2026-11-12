@@ -201,6 +201,26 @@ def test_uploaded_gps_is_inherited_as_capture_proxy_without_fake_range(setup):
     assert alias["analysis_id"] == analysis["analysis_id"]
 
 
+def test_uploaded_replay_uses_its_calibration_snapshot_and_preserves_capture_gps(setup):
+    setup.config.value["calibration"].update(height_m=1, pitch_deg=0)
+    setup.store.start_session("uploaded", "upload:drive.avi", setup.config.value)
+    setup.store.session_update("uploaded", source_type="upload", source_path=str(setup.path), media_kind="video",
+                              original_filename="drive.avi", supplied_latitude=24.3, supplied_longitude=88.6,
+                              location_reference="capture", use_calibration=True)
+    setup.config.value["calibration"].update(height_m=2)
+
+    analysis = analyze(setup, "session:uploaded")
+    result = process(setup, analysis, .5)
+    for items in (result["detections"], result["hazards"]):
+        pothole = next(item for item in items if item["class_name"] == "Pothole")
+        assert pothole["distance_m"] == pytest.approx((20**2 + 6**2)**.5)
+        assert pothole["latitude"] == 24.3 and pothole["longitude"] == 88.6
+        assert pothole["location_method"] == "fixed_capture_location_proxy"
+        assert pothole["provisional"] is True
+    alias = analyze(setup, "session:" + analysis["session_id"])
+    assert alias["analysis_id"] == analysis["analysis_id"]
+
+
 def test_frame_transaction_rolls_back_hazards_and_cache_together(setup, monkeypatch):
     analysis = analyze(setup)
     update = HazardAccumulator.update

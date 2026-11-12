@@ -89,6 +89,56 @@ def test_export_saved_hazard_and_formula_escape(client):
     assert client.get("/api/hazards").json()["hazards"][0]["id"] == "test:1"
 
 
+def test_saved_hazard_thumbnail_still_serves_evidence(client):
+    module.store.start_session("test", "fixture", {})
+    module.store.save_hazard("test", {"id": "test:1", "class_name": "Pothole"})
+    module.store.save_evidence("test:1", b"first jpeg", {"frame_index": 3})
+    hazard = client.get("/api/hazards").json()["hazards"][0]
+    response = client.get(hazard["thumbnail_url"])
+    assert response.content == b"first jpeg"
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert client.get("/api/evidence/999.jpg").status_code == 404
+
+
+@pytest.mark.parametrize("source_type, source_label", [("camera", "Live camera"), ("replay_detection", "Detection replay")])
+def test_hazard_report_survives_detection_updates_and_includes_evidence(client, source_type, source_label):
+    module.store.start_session("report", source_type, {})
+    detection = {"id": "report:1", "source_type": source_type, "class_name": "Pothole", "confidence": 0.8,
+                 "latitude": 24.0, "longitude": 88.0, "first_video_time_s": 1.25}
+    module.store.save_hazard("report", detection)
+    report_url = "/api/hazard-report?hazard_id=report%3A1"
+    incident_url = "/api/incident-report?hazard_id=report%3A1"
+    assert client.get(report_url).json()["severity"] == "medium"
+    assert "No evidence frames saved" in client.get(incident_url).text
+
+    details = {"title": "  Road damage  ", "address": "Main St", "notes": "<script>alert(1)</script>", "severity": "high"}
+    saved = client.put(report_url, json=details)
+    assert saved.status_code == 200
+    assert saved.json()["title"] == "Road damage"
+    assert client.put(report_url, json=details).json()["reported_at"] == saved.json()["reported_at"]
+    assert client.put(report_url, json={**details, "severity": "urgent"}).status_code == 422
+    assert client.put(report_url, json={**details, "latitude": 12}).status_code == 422
+
+    module.store.save_hazard("report", {**detection, "confidence": 0.95})
+    frame = module.store.save_evidence("report:1", b"jpeg", {"frame_index": 9, "time_s": 1.25})
+    stored = client.get(report_url).json()
+    assert stored["confidence"] == 0.95
+    assert stored["severity"] == "high"
+    assert stored["notes"] == details["notes"]
+    incident = client.get(incident_url)
+    assert incident.status_code == 200
+    for text in (source_label, "Road damage", "Main St", "24.000000, 88.000000", "95%", "1.25 s", frame["url"], "&lt;script&gt;"):
+        assert text in incident.text
+    assert "<script>" not in incident.text
+
+
+def test_reporting_unknown_hazard_returns_404(client):
+    assert client.get("/api/hazard-report?hazard_id=missing").status_code == 404
+    assert client.put("/api/hazard-report?hazard_id=missing", json={}).status_code == 404
+    assert client.get("/api/incident-report?hazard_id=missing").status_code == 404
+
+
 def test_cross_origin_control_rejected(client):
     response = client.post("/api/session/stop", headers={"Origin": "https://unrelated.invalid"})
     assert response.status_code == 403

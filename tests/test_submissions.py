@@ -217,6 +217,40 @@ def test_video_tracks_each_hazard_with_hard_ten_frame_limit(setup, tmp_path):
     assert setup.store.session(job["session_id"])["metadata"]["sampled_frames"] == 40
 
 
+@pytest.mark.parametrize("use_calibration", [False, True])
+def test_video_detection_without_gps_uses_calibration_only_when_requested(setup, use_calibration):
+    profile = setup.service.config_store.value["calibration"]
+    profile.update(width=120, height=80, fx=100, fy=100, cx=60, cy=40, height_m=1, pitch_deg=0,
+                   verified=True)
+    path = setup.root / "fixture.avi"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 10, (120, 80))
+    assert writer.isOpened()
+    for _ in range(3):
+        writer.write(np.zeros((80, 120, 3), np.uint8))
+    writer.release()
+    response = setup.client.post("/api/submissions", data={"use_calibration": str(use_calibration).lower()},
+                                 files={"file": ("drive.avi", path.read_bytes(), "video/x-msvideo")})
+    job = completed(setup, response)
+    assert job["status"] == "completed", job.get("error")
+    pothole = next(item for item in job["hazards"] if item["class_name"] == "Pothole")
+    assert pothole["latitude"] is None and pothole["longitude"] is None
+    assert pothole["location_method"] is None
+    assert pothole["distance_m"] == (pytest.approx((20**2 + 6**2)**.5) if use_calibration else None)
+    session = setup.store.session(job["session_id"])
+    assert session["metadata"]["use_calibration"] is use_calibration
+    if use_calibration:
+        assert session["config"]["calibration"]["height_m"] == 1
+        assert pothole["provisional"] is False
+
+
+def test_photo_rejects_video_calibration_option(setup):
+    response = setup.client.post("/api/submissions", data=fields(use_calibration="true"),
+                                 files={"file": ("road.jpg", image_bytes(), "image/jpeg")})
+    assert response.status_code == 422
+    assert not setup.service.active()
+    assert not list(setup.service.upload_root.iterdir())
+
+
 def test_unknown_or_interrupted_job_has_honest_status(setup):
     assert setup.client.get("/api/submissions/no-such-job").status_code == 404
     setup.store.start_session("interrupted", "upload:test.mp4", defaults())
